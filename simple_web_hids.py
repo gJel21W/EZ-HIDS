@@ -7,49 +7,41 @@ from pathlib import Path
 from datetime import datetime
 import re
 import requests
+import yaml
+import sys
+import signal
 
-# Конфигурация программы
-CONFIG = {
-    # Пути для мониторинга
-    "paths_to_watch": [
-        "/var/www/html", # Корень веб-сайта
-        "/etc/nginx/nginx.conf", # Основной конфиг Nginx
-        "/etc/nginx/sites-available/", # Конфиги сайтов
-    ],
-    # Лог-файлы для анализа
-    "log_files": {
-        "/var/log/nginx/access.log": ["nginx_access"],
-        "/var/log/nginx/error.log": ["nginx_error"],
-        "/var/log/apache2/access.log": ["apache_access"],
-        "/var/log/apache2/error.log": ["apache_error"],
-    },
-    # Регулярные выражения для поиска угроз в логах
-    "log_patterns": {
-        "sql_injection": re.compile(r'(\%27)|(\')|(\-\-)|(\%23)|(#)|(union.*select)', re.I),
-        "path_traversal": re.compile(r'(\.\./)|(\.\.\\\\)', re.I),
-        "xss_attempt": re.compile(r'((\%3C)|<)((\%2F)|\/)*[a-z0-9\%]+((\%3E)|>)', re.I),
-        "scanner_bot": re.compile(r'(nikto|sqlmap|wget|curl|nessus|acunetix)', re.I),
-        "auth_failure": re.compile(r'(failed|invalid|authentication error)', re.I),
-    },
-    # Настройки Telegram Bot API
-    "telegram": {
-        "bot_token": "ВАШ_TELEGRAM_BOT_TOKEN",# Необходимо получить в @BotFather
-        "chat_id": "ВАШ_CHAT_ID", # Можно узнать в @userinfobot
-        "enabled": True # Включение/отключение оповещений
-    },
-    # Файл для хранения эталонных хэшей (базовая линия)
-    "baseline_file": "/var/tmp/hids_baseline.json",
-    # Интервал проверки в секундах
-    "check_interval": 60
-}
+CONFIG_PATH = "/etc/hids/config.yaml"
 
-# Модуль FIM (мониторинг целостности файлов)
+def load_config():
+    if not os.path.exists(CONFIG_PATH):
+        raise FileNotFoundError(f"Отсутствует файл конфигурации по пути {CONFIG_PATH}")
+    with open(CONFIG_PATH, 'r') as f:
+        config = yaml.safe_load(f)
+    required_keys = ['telegram', 'scan_interval', 'files_to_watch', 'log_files_to_monitor', 'baseline_file']
+    missing = [k for k in required_keys if k not in config]
+    if missing:
+        raise ValueError(f"Отстутствуют значения  в конфигурации: {', '.join(missing)}")
+    for log_entry in config.get('log_files_to_monitor', []):
+        if 'alert_rules' in log_entry:
+            for rule in log_entry['alert_rules']:
+                try:
+                    rule['compiled_regex'] = re.compile(rule['regex'], re.I)
+                except re.error as e:
+                    raise ValueError(f"Invalid regex in {log_entry['path']}: {rule['regex']} - {e}")
+    if config['telegram'].get('enabled', False):
+        if config['telegram']['bot_token'] == "YOUR_BOT_TOKEN_HERE" or config['telegram']['chat_id'] == "YOUR_CHAT_ID_HERE":
+            logging.warning("Отсутствует конфигурация телеграм. Уведомления отключены.")
+            config['telegram']['enabled'] = False
+    return config
+
 class FIMonitor:
-    """Мониторинг целостности файлов через хэши SHA-256."""
+    def __init__(self, config):
+        self.config = config
+        self.baseline_path = config['baseline_file']
 
     @staticmethod
     def calculate_hash(filepath):
-        """Вычисляет SHA-256 хэш файла."""
         sha256_hash = hashlib.sha256()
         try:
             with open(filepath, "rb") as f:
@@ -57,13 +49,12 @@ class FIMonitor:
                     sha256_hash.update(byte_block)
             return sha256_hash.hexdigest()
         except (IOError, PermissionError) as e:
-            logging.warning(f"Не могу прочитать файл {filepath}: {e}")
+            logging.warning(f"Невозможно прочитать файл {filepath}: {e}")
             return None
 
     def create_baseline(self):
-        """Создает первоначальную базу хэшей (базовую линию)."""
         baseline = {}
-        for path in CONFIG["paths_to_watch"]:
+        for path in self.config['files_to_watch']:
             p = Path(path)
             if p.is_file():
                 file_hash = self.calculate_hash(str(p))
@@ -75,40 +66,36 @@ class FIMonitor:
                         file_hash = self.calculate_hash(str(file))
                         if file_hash:
                             baseline[str(file)] = file_hash
-        # Сохраняем в файл
-        with open(CONFIG["baseline_file"], 'w') as f:
+        with open(self.baseline_path, 'w') as f:
             json.dump(baseline, f, indent=4)
-        logging.info(f"Базовая линия создана. Записано {len(baseline)} файлов.")
+        logging.info(f"Создан SHA-отпечаток {len(baseline)} файлов.")
         return baseline
 
     def load_baseline(self):
-        """Загружает базу хэшей из файла."""
-        if os.path.exists(CONFIG["baseline_file"]):
-            with open(CONFIG["baseline_file"], 'r') as f:
+        if os.path.exists(self.baseline_path):
+            with open(self.baseline_path, 'r') as f:
                 return json.load(f)
+        logging.warning("SHA-отпечаток отсутствует. Создайте его с помощью --create-baseline.")
         return {}
 
     def check_for_changes(self):
-        """Сравнивает текущие хэши с базовой линией и сообщает об изменениях."""
         alerts = []
         baseline = self.load_baseline()
         if not baseline:
-            logging.warning("Базовая линия отсутствует. Запустите скрипт с ключом '--create-baseline'.")
             return alerts
-
         current_files = set()
-        # Вычисляем хэши для всех отслеживаемых файлов
-        for path in CONFIG["paths_to_watch"]:
+        for path in self.config['files_to_watch']:
             p = Path(path)
             if p.is_file():
-                current_files.add(str(p))
-                current_hash = self.calculate_hash(str(p))
+                file_str = str(p)
+                current_files.add(file_str)
+                current_hash = self.calculate_hash(file_str)
                 if current_hash:
-                    old_hash = baseline.get(str(p))
+                    old_hash = baseline.get(file_str)
                     if not old_hash:
-                        alerts.append(f"[FIM -> НОВЫЙ ФАЙЛ] Добавлен: {p}")
+                        alerts.append(f"[FIM -> НОВЫЙ ФАЙЛ] Создание: {file_str}")
                     elif current_hash != old_hash:
-                        alerts.append(f"[FIM -> ИЗМЕНЕНИЕ] Файл изменен: {p}")
+                        alerts.append(f"[FIM -> ИЗМЕНЕНИЕ] Изменение: {file_str} (старый файл: {old_hash[:10]}..., новый файл: {current_hash[:10]}...)")
             elif p.is_dir():
                 for file in p.rglob("*"):
                     if file.is_file():
@@ -118,154 +105,124 @@ class FIMonitor:
                         if current_hash:
                             old_hash = baseline.get(file_str)
                             if not old_hash:
-                                alerts.append(f"[FIM -> НОВЫЙ ФАЙЛ] Добавлен: {file}")
+                                alerts.append(f"[FIM -> НОВЫЙ ФАЙЛ] Создание: {file_str}")
                             elif current_hash != old_hash:
-                                alerts.append(f"[FIM -> ИЗМЕНЕНИЕ] Файл изменен: {file}")
-
-        # Проверяем удаленные файлы
-        for tracked_file in baseline.keys():
+                                alerts.append(f"[FIM -> ИЗМЕНЕНИЕ] Изменение: {file_str} (старый файл: {old_hash[:10]}..., новый файл: {current_hash[:10]}...)")
+        for tracked_file in list(baseline.keys()):
             if tracked_file not in current_files:
-                alerts.append(f"[FIM -> УДАЛЕНИЕ] Файл удален: {tracked_file}")
-
+                alerts.append(f"[FIM -> УДАЛЕНИЕ] Удаление: {tracked_file}")
         return alerts
 
-# Модкль анализа лог-файлов
 class LogAnalyzer:
-    """Анализирует логи веб-сервера на предмет подозрительной активности."""
-
     def __init__(self):
-        self.file_pointers = {}  # Храним позицию в файле для каждого лога
+        self.file_pointers = {}
 
-    def analyze_new_entries(self, log_path, log_types):
-        """Читает новые строки в лог-файле и проверяет их по шаблонам."""
+    def analyze_new_entries(self, log_path, alert_rules):
         alerts = []
         if not os.path.exists(log_path):
+            logging.warning(f"Лог файл не найден: {log_path}")
             return alerts
-
         current_position = self.file_pointers.get(log_path, 0)
         try:
             with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
                 f.seek(current_position)
                 new_lines = f.readlines()
                 self.file_pointers[log_path] = f.tell()
-
                 for line_num, line in enumerate(new_lines, start=1):
                     line = line.strip()
                     if not line:
                         continue
-                    for rule_name, pattern in CONFIG["log_patterns"].items():
-                        if pattern.search(line):
+                    for rule in alert_rules:
+                        if rule['compiled_regex'].search(line):
                             alert_msg = (
-                                f"[LOG -> {rule_name.upper()}]\n"
+                                f"[ЛОГ -> {rule['name'].upper()}]\n"
                                 f"Файл: {log_path}\n"
-                                f"Строка: {line_num}\n"
-                                f"Образец: {pattern.pattern[:50]}...\n"
-                                f"Запись: {line[:200]}..."
+                                f"Строка: {line_num + current_position // 80} (approx)\n"
+                                f"Паттерн: {rule['regex'][:50]}...\n"
+                                f"Начало: {line[:200]}..."
                             )
                             alerts.append(alert_msg)
-                            break  # Не проверяем другие правила для этой строки
+                            break
         except Exception as e:
-            logging.error(f"Ошибка чтения лога {log_path}: {e}")
-
+            logging.error(f"Ошибка чтения лог-файла {log_path}: {e}")
         return alerts
 
-# Модуль оповещений в телеграмм
 class AlertSystem:
-    """Отправка оповещений через Telegram Bot API."""
+    def __init__(self, config):
+        self.config = config
 
-    @staticmethod
-    def send_telegram_alert(message):
-        """Отправляет сообщение в Telegram чат."""
-        if not CONFIG["telegram"]["enabled"]:
+    def send_telegram_alert(self, message):
+        if not self.config['telegram']['enabled']:
             return False
-
-        bot_token = CONFIG["telegram"]["bot_token"]
-        chat_id = CONFIG["telegram"]["chat_id"]
+        bot_token = self.config['telegram']['bot_token']
+        chat_id = self.config['telegram']['chat_id']
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-
-        payload = {
-            "chat_id": chat_id,
-            "text": message,
-            "parse_mode": "HTML"
-        }
+        payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
         try:
             response = requests.post(url, data=payload, timeout=10)
-            return response.status_code == 200
+            if response.status_code == 200:
+                return True
+            else:
+                logging.error(f"Ошибка Telegram API: {response.text}")
+                return False
         except requests.exceptions.RequestException as e:
-            logging.error(f"Ошибка отправки в Telegram: {e}")
+            logging.error(f"Ошибка запроса к Telegram: {e}")
             return False
 
     @staticmethod
     def console_alert(message):
-        """Выводит оповещение в консоль с временной меткой."""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"[{timestamp}] {message}")
 
-# Основной цикл
-def main_loop():
-    """Основной цикл мониторинга."""
+def main_loop(config):
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler("/var/tmp/hids.log"),
+            logging.FileHandler("/var/log/ez_hids.log"),
             logging.StreamHandler()
         ]
     )
-
-    logging.info("Запуск HIDS для веб-сервера...")
-    fim = FIMonitor()
+    logging.info("Запуск EZ-HIDS...")
+    fim = FIMonitor(config)
     log_analyzer = LogAnalyzer()
-    alerter = AlertSystem()
+    alerter = AlertSystem(config)
 
-    # Проверка конфигурации Telegram
-    if CONFIG["telegram"]["enabled"]:
-        if "ВАШ_TELEGRAM_BOT_TOKEN" in CONFIG["telegram"]["bot_token"]:
-            logging.warning("Telegram токен не настроен. Оповещения отключены.")
-            CONFIG["telegram"]["enabled"] = False
-
-    logging.info(f"Мониторинг запущен. Интервал проверки: {CONFIG['check_interval']}с")
-
-    try:
-        while True:
-            all_alerts = []
-            timestamp = datetime.now().strftime("%H:%M:%S")
-
-            # Проверка целостности файлов
-            fim_alerts = fim.check_for_changes()
-            all_alerts.extend(fim_alerts)
-
-            # Анализ логов
-            for log_file in CONFIG["log_files"]:
-                log_alerts = log_analyzer.analyze_new_entries(log_file, CONFIG["log_files"][log_file])
-                all_alerts.extend(log_alerts)
-
-            # Оповещение о всех обнаруженных инцидентах
-            if all_alerts:
-                consolidated_message = f"<b>🚨 HIDS Оповещение ({timestamp})</b>\n" + "\n---\n".join(all_alerts)
-                alerter.console_alert(f"Обнаружено {len(all_alerts)} инцидента(ов).")
-                if CONFIG["telegram"]["enabled"]:
-                    alerter.send_telegram_alert(consolidated_message[:4000])  # Обрезка для лимита Telegram
-            else:
-                logging.debug(f"Проверка {timestamp} - угроз не обнаружено.")
-
-            time.sleep(CONFIG["check_interval"])
-
-    except KeyboardInterrupt:
-        logging.info("Мониторинг остановлен пользователем.")
-    except Exception as e:
-        logging.critical(f"Критическая ошибка в основном цикле: {e}", exc_info=True)
+    def signal_handler(sig, frame):
+        logging.info("Выключение EZ-HIDS.")
+        sys.exit(0)
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    while True:
+        all_alerts = []
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        fim_alerts = fim.check_for_changes()
+        all_alerts.extend(fim_alerts)
+        for log_entry in config['log_files_to_monitor']:
+            log_path = log_entry['path']
+            alert_rules = log_entry.get('alert_rules', [])
+            log_alerts = log_analyzer.analyze_new_entries(log_path, alert_rules)
+            all_alerts.extend(log_alerts)
+        if all_alerts:
+            consolidated_message = f"<b> EZ-HIDS тревога ({timestamp})</b>\n\n" + "\n---\n".join(all_alerts)
+            alerter.console_alert(f"Количество обнаруженных инцидентов: {len(all_alerts)}")
+            alerter.send_telegram_alert(consolidated_message[:4096])
+        time.sleep(config['scan_interval'])
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="HIDS для веб-серверов")
-    parser.add_argument("--create-baseline", action="store_true", help="Создать первоначальную базу хэшей файлов")
+    parser = argparse.ArgumentParser(description="EZ-HIDS: Система обнаружения вторжений (HIDS) для веб-серверов")
+    parser.add_argument("--create-baseline", action="store_true", help="Создание SHA-отпечатка")
     args = parser.parse_args()
-
-    fim = FIMonitor()
+    try:
+        config = load_config()
+    except Exception as e:
+        print(f"Config error: {e}")
+        sys.exit(1)
+    fim = FIMonitor(config)
     if args.create_baseline:
-        print("Создание базовой линии файлов...")
+        print("Создание SHA-отпечатка...")
         fim.create_baseline()
-        print(f"Базовая линия сохранена в {CONFIG['baseline_file']}")
+        print(f"SHA-отпечаток сохранен {config['baseline_file']}")
     else:
-        main_loop()
+        main_loop(config)
