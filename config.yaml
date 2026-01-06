@@ -1,0 +1,34 @@
+# Настройки Telegram бота для оповещений
+telegram:
+  bot_token: "YOUR_BOT_TOKEN_HERE"
+  chat_id: "YOUR_CHAT_ID_HERE"
+  enabled: true
+
+# Настройки интервала проверок (в секундах)
+scan_interval: 60
+
+# Файлы и директории для мониторинга целостности
+files_to_watch:
+  - /var/www/html/
+  - /etc/nginx/nginx.conf
+  - /etc/nginx/sites-available/
+
+# Лог-файлы для анализа с индивидуальными правилами
+log_files_to_monitor:
+  - path: /var/log/nginx/access.log
+    alert_rules:
+      - name: "Path Traversal Attempt"
+        regex: '(\.\./)+'
+      - name: "SQL Injection Attempt"
+        regex: '(union\s+select|select.*from|insert\s+into|update.*set|delete\s+from)'
+      - name: "Web Scanner (Nikto/Acunetix)"
+        regex: '(nikto|acunetix|nessus)'
+  - path: /var/log/auth.log
+    alert_rules:
+      - name: "Failed SSH Login"
+        regex: 'Failed password for'
+      - name: "Root Access Attempt"
+        regex: 'sudo:.*COMMAND='
+
+# Путь к файлу базовой линии хэшей
+baseline_file: "/var/tmp/hids_baseline.json"
